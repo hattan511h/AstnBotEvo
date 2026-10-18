@@ -243,21 +243,64 @@ async function ensureYtDlp() {
 }
 
 // ننزّل الأغنية لملف مؤقت أول (أضمن من البث المباشر، وأخطاء yt-dlp تبان في اللوق)
-async function downloadAudio(url) {
+async function runDownload(input, extraArgs) {
   const base = `song-${Date.now()}`;
   const dir = tmpdir();
-  try {
-    await execFileP(YTDLP_PATH, [
-      ...YT_ARGS, '--no-playlist', '-f', 'bestaudio/best',
-      '-o', join(dir, `${base}.%(ext)s`), url,
-    ], { timeout: 180_000, maxBuffer: 20 * 1024 * 1024 });
-  } catch (e) {
-    console.error('yt-dlp download failed:\n' + String(e.stderr || e.message).trim().slice(-1200));
-    throw e;
-  }
+  await execFileP(YTDLP_PATH, [
+    ...YT_ARGS, ...extraArgs, '--no-playlist', '-f', 'bestaudio/best',
+    '-o', join(dir, `${base}.%(ext)s`), input,
+  ], { timeout: 180_000, maxBuffer: 20 * 1024 * 1024 });
   const f = readdirSync(dir).find((n) => n.startsWith(base) && !n.endsWith('.part') && !n.endsWith('.ytdl'));
   if (!f) throw new Error('downloaded file not found');
   return join(dir, f);
+}
+
+// يوتيوب يحظر التحميل من السيرفرات بحسب "عميل" التطبيق، فنجرّب عدة عملاء بالترتيب ونتذكر الناجح
+const CLIENT_ATTEMPTS = process.env.YTDLP_EXTRA_ARGS ? [[]] : [
+  [],
+  ['--extractor-args', 'youtube:player_client=tv'],
+  ['--extractor-args', 'youtube:player_client=web_embedded'],
+  ['--extractor-args', 'youtube:player_client=mweb'],
+  ['--extractor-args', 'youtube:player_client=ios'],
+  ['--extractor-args', 'youtube:player_client=android_vr'],
+];
+const SOUNDCLOUD_FALLBACK = (process.env.SOUNDCLOUD_FALLBACK ?? 'true') === 'true';
+let preferredAttempt = 0;
+let youtubeBlockedUntil = 0;
+
+function lastErrorLine(e) {
+  const msg = String(e.stderr || e.message);
+  return (msg.split('\n').filter((l) => l.startsWith('ERROR')).pop() || msg).trim().slice(0, 220);
+}
+
+async function downloadAudio(track) {
+  let lastErr;
+  if (Date.now() >= youtubeBlockedUntil) {
+    const order = [preferredAttempt, ...CLIENT_ATTEMPTS.keys()].filter((v, i, a) => a.indexOf(v) === i);
+    for (const idx of order) {
+      try {
+        const file = await runDownload(track.url, CLIENT_ATTEMPTS[idx]);
+        preferredAttempt = idx;
+        console.log(`✅ YouTube download ok (client attempt ${idx})`);
+        return file;
+      } catch (e) {
+        lastErr = e;
+        console.warn(`yt-dlp attempt ${idx} failed: ${lastErrorLine(e)}`);
+      }
+    }
+    youtubeBlockedUntil = Date.now() + 10 * 60 * 1000; // كل المحاولات فشلت: لا تضيّع وقت 10 دقايق
+    console.warn('YouTube download blocked from this server; skipping YouTube for 10 minutes');
+  }
+  if (SOUNDCLOUD_FALLBACK && track.query && !/^https?:\/\//i.test(track.query)) {
+    try {
+      console.log(`↩️  Trying SoundCloud for: ${track.query}`);
+      return await runDownload(`scsearch1:${track.query}`, []);
+    } catch (e) {
+      lastErr = e;
+      console.warn(`SoundCloud failed: ${lastErrorLine(e)}`);
+    }
+  }
+  throw lastErr ?? new Error('no source could download this track');
 }
 
 function cleanup(track) {
@@ -273,7 +316,7 @@ async function playNext() {
   loading = true;
   console.log('⬇️  Downloading:', next.title);
   try {
-    next.file = await downloadAudio(next.url);
+    next.file = await downloadAudio(next);
   } catch {
     loading = false;
     current = null;
@@ -291,6 +334,7 @@ player.on('stateChange', (o, n) => console.log(`player: ${o.status} -> ${n.statu
 
 async function enqueue(query) {
   const track = await searchYouTube(query);
+  track.query = query;
   queue.push(track);
   console.log('➕ Queued:', track.title);
   if (player.state.status === AudioPlayerStatus.Idle) playNext();
