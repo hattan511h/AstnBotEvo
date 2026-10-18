@@ -84,6 +84,7 @@ async function askModel(wavBuffer) {
   const data = await res.json();
   const text = data.choices?.[0]?.message?.content ?? '';
   const m = text.match(/\{[\s\S]*\}/);
+  if (!m) console.warn('model returned no JSON:', text.slice(0, 300));
   return m ? JSON.parse(m[0]) : null;
 }
 
@@ -169,6 +170,7 @@ async function speakNow(text) {
   });
   if (!res.ok) throw new Error(`TTS ${res.status}: ${await res.text()}`);
   const audio = Buffer.from(await res.arrayBuffer());
+  console.log(`🔊 TTS ok (${audio.length} bytes)`);
   if (!connection) return;
 
   const wasPlaying = player.state.status === AudioPlayerStatus.Playing;
@@ -233,7 +235,9 @@ function listen(conn) {
       busy.delete(userId);
       const pcm = Buffer.concat(chunks);
       const secs = pcm.length / (48000 * 2 * 2);
-      if (secs < 0.6 || secs > 20 || rms(pcm) < 300) return; // تجاهل الضجيج/الكلام الطويل
+      const level = Math.round(rms(pcm));
+      console.log(`🎙️ clip from ${userId}: ${secs.toFixed(1)}s, level ${level}`);
+      if (secs < 0.6 || secs > 20 || level < 300) { console.log('   (skipped: too short/long/quiet)'); return; }
       try {
         const intent = await askModel(pcmToWav(toMono16k(pcm), 16000, 1));
         console.log(`🎤 ${userId}:`, intent);
@@ -253,6 +257,9 @@ function connect() {
   connection.subscribe(player);
   listen(connection);
   const conn = connection;
+  entersState(conn, VoiceConnectionStatus.Ready, 20_000)
+    .then(() => { console.log('✅ Voice connection ready'); say('تم، أنا جاهز'); })
+    .catch((e) => console.error('voice connection not ready:', e.message));
   conn.on(VoiceConnectionStatus.Disconnected, async () => {
     try {
       await Promise.race([
@@ -297,6 +304,9 @@ client.on(Events.MessageCreate, async (msg) => {
   } else if (cmd === '!leave') {
     leave();
     msg.react('👋');
+  } else if (cmd === '!say' && rest.length) {
+    say(rest.join(' '));
+    msg.react('🔊');
   } else if (cmd === '!play' && rest.length) {
     try { await enqueue(rest.join(' ')); msg.react('🎶'); }
     catch { msg.reply('ما لقيت شي 😕'); }
