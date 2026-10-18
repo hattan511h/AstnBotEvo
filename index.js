@@ -6,7 +6,7 @@ import { writeFileSync, existsSync, chmodSync, readdirSync, unlinkSync } from 'n
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Client, GatewayIntentBits, Events } from 'discord.js';
+import { Client, GatewayIntentBits, Events, SlashCommandBuilder, MessageFlags } from 'discord.js';
 import {
   joinVoiceChannel, entersState, VoiceConnectionStatus, EndBehaviorType,
   createAudioPlayer, createAudioResource, AudioPlayerStatus,
@@ -203,7 +203,7 @@ let current = null;
 
 async function searchYouTube(query) {
   const { stdout } = await execFileP(YTDLP_PATH, [
-    ...YT_ARGS, '--no-playlist', '--print', '%(title)s\n%(id)s', `ytsearch1:${query}`,
+    ...YT_ARGS, '--no-playlist', '--print', '%(title)s\n%(id)s', (/^https?:\/\//i.test(query) ? query : `ytsearch1:${query}`),
   ], { timeout: 30_000 });
   const [title, id] = stdout.trim().split('\n');
   if (!id) throw new Error('no result');
@@ -282,6 +282,7 @@ async function enqueue(query) {
   queue.push(track);
   console.log('➕ Queued:', track.title);
   if (player.state.status === AudioPlayerStatus.Idle) playNext();
+  return track;
 }
 
 // ---------- رد صوتي (TTS مجاني من OpenRouter) ----------
@@ -400,6 +401,19 @@ const client = new Client({
   ],
 });
 
+const COMMANDS = [
+  new SlashCommandBuilder().setName('play').setDescription('شغّل أغنية من يوتيوب')
+    .addStringOption((o) => o.setName('query').setDescription('اسم الأغنية أو رابط يوتيوب').setRequired(true)),
+  new SlashCommandBuilder().setName('skip').setDescription('تخطَّ الأغنية الحالية'),
+  new SlashCommandBuilder().setName('stop').setDescription('أوقف الموسيقى وامسح القائمة'),
+].map((c) => c.toJSON());
+
+function registerCommands(guild) {
+  return guild.commands.set(COMMANDS)
+    .then(() => console.log(`✅ Slash commands registered in "${guild.name}"`))
+    .catch((e) => console.error(`Slash registration failed in "${guild.name}": ${e.message} — re-invite the bot with the applications.commands scope`));
+}
+
 const ALLOWED_USERS = new Set((process.env.ALLOWED_USER_IDS || '').split(',').map((x) => x.trim()).filter(Boolean));
 let target = null;      // { guildId, channelId, adapterCreator }
 let connection = null;
@@ -486,6 +500,7 @@ function leave() {
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   await ensureYtDlp().catch((e) => console.error('yt-dlp setup failed:', e.message));
+  for (const g of client.guilds.cache.values()) registerCommands(g);
   if (GUILD_ID && VOICE_CHANNEL_ID) {
     const guild = await client.guilds.fetch(GUILD_ID);
     target = { guildId: guild.id, channelId: VOICE_CHANNEL_ID, adapterCreator: guild.voiceAdapterCreator };
@@ -514,6 +529,57 @@ client.on(Events.MessageCreate, async (msg) => {
   } else if (cmd === '!play' && rest.length) {
     try { await enqueue(rest.join(' ')); msg.react('🎶'); }
     catch { msg.reply('ما لقيت شي 😕'); }
+  }
+});
+
+client.on(Events.GuildCreate, (g) => registerCommands(g));
+
+client.on(Events.InteractionCreate, async (i) => {
+  if (!i.isChatInputCommand() || !i.guild) return;
+
+  const reply = (content, ephemeral = false) => (i.deferred || i.replied
+    ? i.editReply({ content })
+    : i.reply({ content, ...(ephemeral ? { flags: MessageFlags.Ephemeral } : {}) }));
+
+  try {
+    const alive = connection && connection.state.status !== VoiceConnectionStatus.Destroyed && target;
+    const userVc = i.member?.voice?.channelId;
+
+    if (i.commandName === 'play') {
+      if (!alive && !userVc) return await reply('ادخل روم صوتي أول 🎧', true);
+      if (alive && userVc !== target.channelId) return await reply('لازم تكون معي في الروم الصوتي 🎧', true);
+      if (!alive) {
+        target = { guildId: i.guild.id, channelId: userVc, adapterCreator: i.guild.voiceAdapterCreator };
+        connect();
+      }
+      await i.deferReply();
+      const wasBusy = Boolean(current) || queue.length > 0;
+      try {
+        const track = await enqueue(i.options.getString('query', true));
+        return await reply(`${wasBusy ? '➕ أضفتها للقائمة' : '🎶 بشغّل'}: **${track.title}**`);
+      } catch (e) {
+        console.error('/play failed:', e.message);
+        return await reply('ما لقيت شي 😕');
+      }
+    }
+
+    if (i.commandName === 'skip') {
+      if (!alive || !current) return await reply('ما فيه شي شغال حالياً', true);
+      if (userVc !== target.channelId) return await reply('لازم تكون معي في الروم الصوتي 🎧', true);
+      const title = current.title;
+      await runIntent({ action: 'skip' });
+      return await reply(`⏭️ تخطيت: **${title}**`);
+    }
+
+    if (i.commandName === 'stop') {
+      if (!alive) return await reply('البوت مو في روم صوتي', true);
+      if (userVc !== target.channelId) return await reply('لازم تكون معي في الروم الصوتي 🎧', true);
+      await runIntent({ action: 'stop' });
+      return await reply('⏹️ تم الإيقاف ومسحت القائمة');
+    }
+  } catch (e) {
+    console.error('slash command failed:', e.message);
+    try { await reply('صار خطأ 😕', true); } catch { /* ignore */ }
   }
 });
 
