@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Readable } from 'node:stream';
-import { writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync, existsSync, chmodSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -30,7 +30,7 @@ const {
 
 // yt-dlp: المحمّل وقت npm install، أو الموجود في PATH
 const LOCAL_YTDLP = fileURLToPath(new URL(process.platform === 'win32' ? './yt-dlp.exe' : './yt-dlp', import.meta.url));
-const YTDLP_PATH = YTDLP_ENV || (existsSync(LOCAL_YTDLP) ? LOCAL_YTDLP : 'yt-dlp');
+let YTDLP_PATH = YTDLP_ENV || (existsSync(LOCAL_YTDLP) ? LOCAL_YTDLP : 'yt-dlp');
 
 // وسائط مشتركة: JS runtime (يوتيوب يحتاجه) + كوكيز اختيارية (لو يوتيوب حظر السيرفر)
 const YT_ARGS = [];
@@ -177,6 +177,26 @@ async function searchYouTube(query) {
   const [title, id] = stdout.trim().split('\n');
   if (!id) throw new Error('no result');
   return { title, url: `https://www.youtube.com/watch?v=${id}` };
+}
+
+async function ensureYtDlp() {
+  try {
+    await execFileP(YTDLP_PATH, ['--version'], { timeout: 20_000 });
+    console.log('✅ yt-dlp found');
+    return;
+  } catch { /* مو موجود */ }
+  console.log('⬇️  yt-dlp not found, downloading...');
+  const win = process.platform === 'win32';
+  const asset = win ? 'yt-dlp.exe'
+    : process.platform === 'darwin' ? 'yt-dlp_macos'
+    : process.arch === 'arm64' ? 'yt-dlp_linux_aarch64' : 'yt-dlp_linux';
+  const dest = join(tmpdir(), win ? 'yt-dlp.exe' : 'yt-dlp');
+  const res = await fetch(`https://github.com/yt-dlp/yt-dlp/releases/latest/download/${asset}`, { redirect: 'follow' });
+  if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`);
+  writeFileSync(dest, Buffer.from(await res.arrayBuffer()));
+  chmodSync(dest, 0o755);
+  YTDLP_PATH = dest;
+  console.log('✅ yt-dlp ready at', dest);
 }
 
 function playNext() {
@@ -351,14 +371,23 @@ function listen(conn) {
   });
 }
 
+let reconnectTimer = null;
+function scheduleReconnect(conn) {
+  if (conn !== connection) return;
+  if (conn.state.status !== VoiceConnectionStatus.Destroyed) conn.destroy();
+  if (!target || reconnectTimer) return;
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; if (target) connect(); }, 5_000);
+}
+
 function connect() {
   connection = joinVoiceChannel({ ...target, selfDeaf: false, selfMute: false });
   connection.subscribe(player);
   listen(connection);
   const conn = connection;
+  conn.on('error', (e) => { console.error('voice connection error:', e.message); scheduleReconnect(conn); });
   entersState(conn, VoiceConnectionStatus.Ready, 20_000)
     .then(() => { console.log('✅ Voice connection ready'); say('تم، أنا جاهز'); })
-    .catch((e) => console.error('voice connection not ready:', e.message));
+    .catch((e) => { console.error('voice connection not ready:', e.message); scheduleReconnect(conn); });
   conn.on(VoiceConnectionStatus.Disconnected, async () => {
     try {
       await Promise.race([
@@ -366,8 +395,7 @@ function connect() {
         entersState(conn, VoiceConnectionStatus.Connecting, 5_000),
       ]);
     } catch {
-      conn.destroy();
-      if (target) setTimeout(connect, 3_000); // يرجع يدخل لو انطرد/انقطع
+      scheduleReconnect(conn); // يرجع يدخل لو انطرد/انقطع
     }
   });
 }
@@ -381,6 +409,7 @@ function leave() {
 
 client.once(Events.ClientReady, async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+  await ensureYtDlp().catch((e) => console.error('yt-dlp setup failed:', e.message));
   if (GUILD_ID && VOICE_CHANNEL_ID) {
     const guild = await client.guilds.fetch(GUILD_ID);
     target = { guildId: guild.id, channelId: VOICE_CHANNEL_ID, adapterCreator: guild.voiceAdapterCreator };
