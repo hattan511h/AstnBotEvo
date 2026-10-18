@@ -12,7 +12,11 @@ import {
   createAudioPlayer, createAudioResource, AudioPlayerStatus,
   NoSubscriberBehavior, StreamType,
 } from '@discordjs/voice';
-import prism from 'prism-media';
+import OpusScript from 'opusscript';
+
+// شبكة أمان: خطأ عابر ما يطيّح البوت
+process.on('uncaughtException', (e) => console.error('uncaught:', e?.message || e));
+process.on('unhandledRejection', (e) => console.error('unhandled rejection:', e?.message || e));
 
 const execFileP = promisify(execFile);
 
@@ -59,7 +63,12 @@ Rules:
 - "skip" = next song, "stop" = stop and clear the queue, "pause"/"resume" as expected.`;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+const DEFAULT_GEMINI_MODELS = ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'];
+// لكل موديل حد يومي مجاني خاص فيه، فلو خلص واحد ننتقل للي بعده
+const GEMINI_MODELS = process.env.GEMINI_MODELS
+  ? process.env.GEMINI_MODELS.split(',').map((m) => m.trim()).filter(Boolean)
+  : [...new Set([process.env.GEMINI_MODEL, ...DEFAULT_GEMINI_MODELS].filter(Boolean))];
+const geminiBlocked = new Map();
 const GEMINI_THINKING = process.env.GEMINI_THINKING ?? 'low'; // low | medium | high | ''(بدون)
 const GEMINI_TTS_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
 const GEMINI_VOICE = process.env.GEMINI_VOICE || 'Kore';
@@ -71,8 +80,8 @@ function extractJson(text) {
   return m ? JSON.parse(m[0]) : null;
 }
 
-async function askGemini(wavBuffer) {
-  const call = (withThinking) => fetch(`${GEMINI_URL}/${GEMINI_MODEL}:generateContent`, {
+async function askGeminiWith(model, wavBuffer) {
+  const call = (withThinking) => fetch(`${GEMINI_URL}/${model}:generateContent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
     body: JSON.stringify({
@@ -103,6 +112,28 @@ async function askGemini(wavBuffer) {
   const data = await res.json();
   const text = (data.candidates?.[0]?.content?.parts ?? []).filter((p) => !p.thought).map((p) => p.text || '').join('');
   return extractJson(text);
+}
+
+async function askGemini(wavBuffer) {
+  let lastErr;
+  for (const model of GEMINI_MODELS) {
+    if (Date.now() < (geminiBlocked.get(model) ?? 0)) continue;
+    try {
+      return await askGeminiWith(model, wavBuffer);
+    } catch (e) {
+      lastErr = e;
+      if (/^Gemini 429/.test(e.message)) {
+        geminiBlocked.set(model, Date.now() + 60 * 60 * 1000);
+        console.warn(`${model}: free quota exhausted, trying next model`);
+      } else if (/^Gemini 404/.test(e.message)) {
+        geminiBlocked.set(model, Infinity);
+        console.warn(`${model}: not available, skipping`);
+      } else {
+        throw e;
+      }
+    }
+  }
+  throw lastErr ?? new Error('all Gemini models are rate-limited right now');
 }
 
 async function askOpenRouter(wavBuffer) {
@@ -369,6 +400,7 @@ const client = new Client({
   ],
 });
 
+const ALLOWED_USERS = new Set((process.env.ALLOWED_USER_IDS || '').split(',').map((x) => x.trim()).filter(Boolean));
 let target = null;      // { guildId, channelId, adapterCreator }
 let connection = null;
 
@@ -378,19 +410,24 @@ function listen(conn) {
 
   receiver.speaking.on('start', (userId) => {
     if (busy.has(userId) || userId === client.user.id) return;
+    if (ALLOWED_USERS.size && !ALLOWED_USERS.has(userId)) return;
     busy.add(userId);
 
     const opusStream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.AfterSilence, duration: 1200 },
     });
-    const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+    const decoder = new OpusScript(48000, 2, OpusScript.Application.AUDIO);
     const chunks = [];
-    opusStream.pipe(decoder);
-    decoder.on('data', (c) => chunks.push(c));
-    opusStream.on('error', () => busy.delete(userId));
+    let bad = 0;
+    opusStream.on('data', (packet) => {
+      try { chunks.push(Buffer.from(decoder.decode(packet))); } catch { bad++; } // تخطَّ الحزمة التالفة
+    });
+    opusStream.on('error', (e) => console.warn('receive stream error:', e.message));
 
-    decoder.on('end', async () => {
+    opusStream.on('end', async () => {
       busy.delete(userId);
+      try { decoder.delete(); } catch { /* ignore */ }
+      if (bad) console.log(`   (skipped ${bad} bad opus packets)`);
       const pcm = Buffer.concat(chunks);
       const secs = pcm.length / (48000 * 2 * 2);
       const level = Math.round(rms(pcm));
