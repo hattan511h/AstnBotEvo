@@ -41,8 +41,8 @@ if (YT_COOKIES_B64) {
   YT_ARGS.push('--cookies', cookiePath);
 }
 
-if (!DISCORD_TOKEN || !OPENROUTER_API_KEY) {
-  console.error('Missing DISCORD_TOKEN or OPENROUTER_API_KEY in .env');
+if (!DISCORD_TOKEN || !(OPENROUTER_API_KEY || process.env.GEMINI_API_KEY)) {
+  console.error('Missing DISCORD_TOKEN, and either GEMINI_API_KEY or OPENROUTER_API_KEY');
   process.exit(1);
 }
 
@@ -58,7 +58,46 @@ Rules:
 - For "play", query is the song/artist/video to search on YouTube (keep Arabic names in Arabic). Otherwise query is "".
 - "skip" = next song, "stop" = stop and clear the queue, "pause"/"resume" as expected.`;
 
-async function askModel(wavBuffer) {
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_TTS_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
+const GEMINI_VOICE = process.env.GEMINI_VOICE || 'Kore';
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+function extractJson(text) {
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) console.warn('model returned no JSON:', text.slice(0, 300));
+  return m ? JSON.parse(m[0]) : null;
+}
+
+async function askGemini(wavBuffer) {
+  const res = await fetch(`${GEMINI_URL}/${GEMINI_MODEL}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: 'Classify this voice clip.' },
+          { inlineData: { mimeType: 'audio/wav', data: wavBuffer.toString('base64') } },
+        ],
+      }],
+      generationConfig: {
+        temperature: 0,
+        responseMimeType: 'application/json',
+        thinkingConfig: { thinkingBudget: 0 },
+      },
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok) throw new Error(`Gemini ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  const text = (data.candidates?.[0]?.content?.parts ?? []).map((p) => p.text || '').join('');
+  return extractJson(text);
+}
+
+async function askOpenRouter(wavBuffer) {
   const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -82,10 +121,12 @@ async function askModel(wavBuffer) {
   });
   if (!res.ok) throw new Error(`OpenRouter ${res.status}: ${await res.text()}`);
   const data = await res.json();
-  const text = data.choices?.[0]?.message?.content ?? '';
-  const m = text.match(/\{[\s\S]*\}/);
-  if (!m) console.warn('model returned no JSON:', text.slice(0, 300));
-  return m ? JSON.parse(m[0]) : null;
+  return extractJson(data.choices?.[0]?.message?.content ?? '');
+}
+
+// إذا فيه GEMINI_API_KEY يستخدم Gemini مباشرة (له طبقة مجانية)، وإلا OpenRouter
+async function askModel(wavBuffer) {
+  return GEMINI_API_KEY ? askGemini(wavBuffer) : askOpenRouter(wavBuffer);
 }
 
 // ---------- 2) الصوت: PCM -> WAV ----------
@@ -156,7 +197,36 @@ async function enqueue(query) {
 const ttsPlayer = createAudioPlayer();
 let speakChain = Promise.resolve();
 
-async function speakNow(text) {
+async function ttsGemini(text) {
+  const res = await fetch(`${GEMINI_URL}/${GEMINI_TTS_MODEL}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text }] }],
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: GEMINI_VOICE } } },
+      },
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok) throw new Error(`Gemini TTS ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  const part = (data.candidates?.[0]?.content?.parts ?? []).find((p) => p.inlineData);
+  if (!part) throw new Error('Gemini TTS returned no audio');
+  return pcmToWav(Buffer.from(part.inlineData.data, 'base64'), 24000, 1); // PCM 24kHz مونو
+}
+
+// احتياطي مجاني بدون مفتاح (غير رسمي، الصوت بسيط)
+async function ttsGoogle(text) {
+  const lang = /[\u0600-\u06FF]/.test(text) ? 'ar' : 'en';
+  const url = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${lang}&q=${encodeURIComponent(text.slice(0, 200))}`;
+  const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`Google TTS ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function ttsOpenRouter(text) {
   const res = await fetch('https://openrouter.ai/api/v1/audio/speech', {
     method: 'POST',
     headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
@@ -168,9 +238,30 @@ async function speakNow(text) {
     }),
     signal: AbortSignal.timeout(20_000),
   });
-  if (!res.ok) throw new Error(`TTS ${res.status}: ${await res.text()}`);
-  const audio = Buffer.from(await res.arrayBuffer());
-  console.log(`🔊 TTS ok (${audio.length} bytes)`);
+  if (!res.ok) throw new Error(`OpenRouter TTS ${res.status}: ${await res.text()}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function synthesize(text) {
+  const forced = process.env.TTS_PROVIDER;
+  const order = forced ? [forced] : [GEMINI_API_KEY && 'gemini', 'google'].filter(Boolean);
+  const impl = { gemini: ttsGemini, google: ttsGoogle, openrouter: ttsOpenRouter };
+  let lastErr;
+  for (const name of order) {
+    try {
+      const audio = await impl[name](text);
+      console.log(`🔊 TTS ok via ${name} (${audio.length} bytes)`);
+      return audio;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`TTS ${name} failed: ${e.message}`);
+    }
+  }
+  throw lastErr;
+}
+
+async function speakNow(text) {
+  const audio = await synthesize(text);
   if (!connection) return;
 
   const wasPlaying = player.state.status === AudioPlayerStatus.Playing;
