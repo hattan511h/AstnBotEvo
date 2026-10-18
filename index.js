@@ -59,7 +59,8 @@ Rules:
 - "skip" = next song, "stop" = stop and clear the queue, "pause"/"resume" as expected.`;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+const GEMINI_THINKING = process.env.GEMINI_THINKING ?? 'low'; // low | medium | high | ''(بدون)
 const GEMINI_TTS_MODEL = process.env.GEMINI_TTS_MODEL || 'gemini-2.5-flash-preview-tts';
 const GEMINI_VOICE = process.env.GEMINI_VOICE || 'Kore';
 const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
@@ -71,7 +72,7 @@ function extractJson(text) {
 }
 
 async function askGemini(wavBuffer) {
-  const res = await fetch(`${GEMINI_URL}/${GEMINI_MODEL}:generateContent`, {
+  const call = (withThinking) => fetch(`${GEMINI_URL}/${GEMINI_MODEL}:generateContent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
     body: JSON.stringify({
@@ -84,16 +85,23 @@ async function askGemini(wavBuffer) {
         ],
       }],
       generationConfig: {
-        temperature: 0,
         responseMimeType: 'application/json',
-        thinkingConfig: { thinkingBudget: 0 },
+        ...(withThinking && GEMINI_THINKING ? { thinkingConfig: { thinkingLevel: GEMINI_THINKING } } : {}),
       },
     }),
     signal: AbortSignal.timeout(30_000),
   });
+
+  let res = await call(true);
+  if (res.status === 400) {
+    const body = await res.text();
+    if (!/thinking/i.test(body)) throw new Error(`Gemini 400: ${body}`);
+    console.warn('thinkingConfig rejected, retrying without it');
+    res = await call(false);
+  }
   if (!res.ok) throw new Error(`Gemini ${res.status}: ${await res.text()}`);
   const data = await res.json();
-  const text = (data.candidates?.[0]?.content?.parts ?? []).map((p) => p.text || '').join('');
+  const text = (data.candidates?.[0]?.content?.parts ?? []).filter((p) => !p.thought).map((p) => p.text || '').join('');
   return extractJson(text);
 }
 
