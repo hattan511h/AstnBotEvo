@@ -451,7 +451,3 @@ client.on(Events.MessageCreate, async (msg) => {
 });
 
 client.login(DISCORD_TOKEN);
-  }
-});
-
-client.login(DISCORD_TOKEN);
