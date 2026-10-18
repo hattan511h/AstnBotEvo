@@ -2,6 +2,10 @@ import 'dotenv/config';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Readable } from 'node:stream';
+import { writeFileSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Client, GatewayIntentBits, Events } from 'discord.js';
 import {
   joinVoiceChannel, entersState, VoiceConnectionStatus, EndBehaviorType,
@@ -19,8 +23,23 @@ const {
   TTS_VOICE = '',
   VOICE_REPLIES = 'true',
   WAKE_WORDS = 'بوت, يا بوت, bot, hey bot',
-  YTDLP_PATH = 'yt-dlp',
+  YTDLP_PATH: YTDLP_ENV,
+  YTDLP_JS_RUNTIME = 'node',
+  YT_COOKIES_B64,
 } = process.env;
+
+// yt-dlp: المحمّل وقت npm install، أو الموجود في PATH
+const LOCAL_YTDLP = fileURLToPath(new URL(process.platform === 'win32' ? './yt-dlp.exe' : './yt-dlp', import.meta.url));
+const YTDLP_PATH = YTDLP_ENV || (existsSync(LOCAL_YTDLP) ? LOCAL_YTDLP : 'yt-dlp');
+
+// وسائط مشتركة: JS runtime (يوتيوب يحتاجه) + كوكيز اختيارية (لو يوتيوب حظر السيرفر)
+const YT_ARGS = [];
+if (YTDLP_JS_RUNTIME) YT_ARGS.push('--js-runtimes', YTDLP_JS_RUNTIME);
+if (YT_COOKIES_B64) {
+  const cookiePath = join(tmpdir(), 'yt-cookies.txt');
+  writeFileSync(cookiePath, Buffer.from(YT_COOKIES_B64, 'base64'));
+  YT_ARGS.push('--cookies', cookiePath);
+}
 
 if (!DISCORD_TOKEN || !OPENROUTER_API_KEY) {
   console.error('Missing DISCORD_TOKEN or OPENROUTER_API_KEY in .env');
@@ -103,7 +122,7 @@ let current = null;
 
 async function searchYouTube(query) {
   const { stdout } = await execFileP(YTDLP_PATH, [
-    '--no-playlist', '--print', '%(title)s\n%(id)s', `ytsearch1:${query}`,
+    ...YT_ARGS, '--no-playlist', '--print', '%(title)s\n%(id)s', `ytsearch1:${query}`,
   ], { timeout: 30_000 });
   const [title, id] = stdout.trim().split('\n');
   if (!id) throw new Error('no result');
@@ -115,7 +134,7 @@ function playNext() {
   if (!next) { current = null; return; }
   current = next;
   console.log('▶️  Now playing:', next.title);
-  const yt = spawn(YTDLP_PATH, ['-q', '--no-playlist', '-f', 'bestaudio/best', '-o', '-', next.url],
+  const yt = spawn(YTDLP_PATH, ['-q', ...YT_ARGS, '--no-playlist', '-f', 'bestaudio/best', '-o', '-', next.url],
     { stdio: ['ignore', 'pipe', 'ignore'] });
   yt.on('error', (e) => console.error('yt-dlp error:', e.message));
   next.proc = yt;

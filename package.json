@@ -1,0 +1,21 @@
+{
+  "name": "discord-voice-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "node scripts/get-ytdlp.mjs"
+  },
+  "dependencies": {
+    "@discordjs/voice": "latest",
+    "@snazzah/davey": "latest",
+    "discord.js": "latest",
+    "dotenv": "latest",
+    "ffmpeg-static": "latest",
+    "libsodium-wrappers": "latest",
+    "opusscript": "latest",
+    "prism-media": "latest"
+  }
+}
