@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Readable } from 'node:stream';
-import { writeFileSync, existsSync, chmodSync } from 'node:fs';
+import { writeFileSync, existsSync, chmodSync, readdirSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -199,27 +199,50 @@ async function ensureYtDlp() {
   console.log('✅ yt-dlp ready at', dest);
 }
 
-function playNext() {
+// ننزّل الأغنية لملف مؤقت أول (أضمن من البث المباشر، وأخطاء yt-dlp تبان في اللوق)
+async function downloadAudio(url) {
+  const base = `song-${Date.now()}`;
+  const dir = tmpdir();
+  try {
+    await execFileP(YTDLP_PATH, [
+      ...YT_ARGS, '--no-playlist', '-f', 'bestaudio/best',
+      '-o', join(dir, `${base}.%(ext)s`), url,
+    ], { timeout: 180_000, maxBuffer: 20 * 1024 * 1024 });
+  } catch (e) {
+    console.error('yt-dlp download failed:\n' + String(e.stderr || e.message).trim().slice(-1200));
+    throw e;
+  }
+  const f = readdirSync(dir).find((n) => n.startsWith(base) && !n.endsWith('.part') && !n.endsWith('.ytdl'));
+  if (!f) throw new Error('downloaded file not found');
+  return join(dir, f);
+}
+
+function cleanup(track) {
+  if (track?.file) { try { unlinkSync(track.file); } catch { /* ignore */ } track.file = null; }
+}
+
+let loading = false;
+async function playNext() {
+  if (loading) return;
   const next = queue.shift();
   if (!next) { current = null; return; }
   current = next;
+  loading = true;
+  console.log('⬇️  Downloading:', next.title);
+  try {
+    next.file = await downloadAudio(next.url);
+  } catch {
+    loading = false;
+    current = null;
+    return playNext(); // الأغنية فشلت: جرّب اللي بعدها
+  }
+  loading = false;
+  if (next.cancelled) { cleanup(next); return playNext(); }
   console.log('▶️  Now playing:', next.title);
-  const yt = spawn(YTDLP_PATH, [...YT_ARGS, '--no-playlist', '-f', 'bestaudio/best', '-o', '-', next.url],
-    { stdio: ['ignore', 'pipe', 'pipe'] });
-  let errBuf = '';
-  let bytes = 0;
-  yt.stderr.on('data', (d) => { errBuf = (errBuf + d).slice(-4000); });
-  yt.stdout.on('data', (d) => { bytes += d.length; });
-  yt.on('error', (e) => console.error('yt-dlp spawn error:', e.message));
-  yt.on('close', (code, sig) => {
-    console.log(`yt-dlp exited: code=${code} signal=${sig} audioBytes=${bytes}`);
-    if (code && errBuf) console.error('yt-dlp stderr:\n' + errBuf.trim().slice(-1200));
-  });
-  next.proc = yt;
-  player.play(createAudioResource(yt.stdout, { inputType: StreamType.Arbitrary }));
+  player.play(createAudioResource(next.file, { inputType: StreamType.Arbitrary }));
 }
 
-player.on(AudioPlayerStatus.Idle, () => { current?.proc?.kill(); playNext(); });
+player.on(AudioPlayerStatus.Idle, () => { cleanup(current); playNext(); });
 player.on('error', (e) => console.error('player error:', e.message));
 player.on('stateChange', (o, n) => console.log(`player: ${o.status} -> ${n.status}`));
 
@@ -279,19 +302,26 @@ async function ttsOpenRouter(text) {
   return Buffer.from(await res.arrayBuffer());
 }
 
+let geminiTtsBlockedUntil = 0;
 async function synthesize(text) {
   const forced = process.env.TTS_PROVIDER;
   const order = forced ? [forced] : [GEMINI_API_KEY && 'gemini', 'google'].filter(Boolean);
   const impl = { gemini: ttsGemini, google: ttsGoogle, openrouter: ttsOpenRouter };
   let lastErr;
   for (const name of order) {
+    if (name === 'gemini' && Date.now() < geminiTtsBlockedUntil) continue;
     try {
       const audio = await impl[name](text);
       console.log(`🔊 TTS ok via ${name} (${audio.length} bytes)`);
       return audio;
     } catch (e) {
       lastErr = e;
-      console.warn(`TTS ${name} failed: ${e.message}`);
+      if (name === 'gemini' && /\b429\b/.test(e.message)) {
+        geminiTtsBlockedUntil = Date.now() + 60 * 60 * 1000; // حد Gemini اليومي خلص: تجاهله ساعة
+        console.warn('Gemini TTS quota exhausted, using Google TTS for the next hour');
+      } else {
+        console.warn(`TTS ${name} failed: ${String(e.message).slice(0, 300)}`);
+      }
     }
   }
   throw lastErr;
@@ -322,8 +352,8 @@ function say(text) {
 async function runIntent(intent) {
   switch (intent.action) {
     case 'play': if (intent.query) await enqueue(intent.query); break;
-    case 'skip': current?.proc?.kill(); player.stop(true); break;
-    case 'stop': queue.length = 0; current?.proc?.kill(); player.stop(true); break;
+    case 'skip': if (current) current.cancelled = true; player.stop(true); break;
+    case 'stop': queue.length = 0; if (current) current.cancelled = true; player.stop(true); break;
     case 'pause': player.pause(); break;
     case 'resume': player.unpause(); break;
   }
