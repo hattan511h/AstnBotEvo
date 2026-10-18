@@ -204,15 +204,24 @@ function playNext() {
   if (!next) { current = null; return; }
   current = next;
   console.log('▶️  Now playing:', next.title);
-  const yt = spawn(YTDLP_PATH, ['-q', ...YT_ARGS, '--no-playlist', '-f', 'bestaudio/best', '-o', '-', next.url],
-    { stdio: ['ignore', 'pipe', 'ignore'] });
-  yt.on('error', (e) => console.error('yt-dlp error:', e.message));
+  const yt = spawn(YTDLP_PATH, [...YT_ARGS, '--no-playlist', '-f', 'bestaudio/best', '-o', '-', next.url],
+    { stdio: ['ignore', 'pipe', 'pipe'] });
+  let errBuf = '';
+  let bytes = 0;
+  yt.stderr.on('data', (d) => { errBuf = (errBuf + d).slice(-4000); });
+  yt.stdout.on('data', (d) => { bytes += d.length; });
+  yt.on('error', (e) => console.error('yt-dlp spawn error:', e.message));
+  yt.on('close', (code, sig) => {
+    console.log(`yt-dlp exited: code=${code} signal=${sig} audioBytes=${bytes}`);
+    if (code && errBuf) console.error('yt-dlp stderr:\n' + errBuf.trim().slice(-1200));
+  });
   next.proc = yt;
   player.play(createAudioResource(yt.stdout, { inputType: StreamType.Arbitrary }));
 }
 
 player.on(AudioPlayerStatus.Idle, () => { current?.proc?.kill(); playNext(); });
 player.on('error', (e) => console.error('player error:', e.message));
+player.on('stateChange', (o, n) => console.log(`player: ${o.status} -> ${n.status}`));
 
 async function enqueue(query) {
   const track = await searchYouTube(query);
@@ -438,6 +447,10 @@ client.on(Events.MessageCreate, async (msg) => {
   } else if (cmd === '!play' && rest.length) {
     try { await enqueue(rest.join(' ')); msg.react('🎶'); }
     catch { msg.reply('ما لقيت شي 😕'); }
+  }
+});
+
+client.login(DISCORD_TOKEN);
   }
 });
 
