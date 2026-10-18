@@ -38,7 +38,11 @@ let YTDLP_PATH = YTDLP_ENV || (existsSync(LOCAL_YTDLP) ? LOCAL_YTDLP : 'yt-dlp')
 
 // وسائط مشتركة: JS runtime (يوتيوب يحتاجه) + كوكيز اختيارية (لو يوتيوب حظر السيرفر)
 const YT_ARGS = [];
-if (YTDLP_JS_RUNTIME) YT_ARGS.push('--js-runtimes', YTDLP_JS_RUNTIME);
+if (YTDLP_JS_RUNTIME) {
+  // مسار node الفعلي (yt-dlp أحياناً ما يلقاه من PATH)
+  YT_ARGS.push('--js-runtimes', YTDLP_JS_RUNTIME === 'node' ? `node:${process.execPath}` : YTDLP_JS_RUNTIME);
+}
+if (process.env.YTDLP_EXTRA_ARGS) YT_ARGS.push(...process.env.YTDLP_EXTRA_ARGS.split(/\s+/).filter(Boolean));
 if (YT_COOKIES_B64) {
   const cookiePath = join(tmpdir(), 'yt-cookies.txt');
   writeFileSync(cookiePath, Buffer.from(YT_COOKIES_B64, 'base64'));
@@ -202,12 +206,20 @@ const queue = [];
 let current = null;
 
 async function searchYouTube(query) {
-  const { stdout } = await execFileP(YTDLP_PATH, [
-    ...YT_ARGS, '--no-playlist', '--print', '%(title)s\n%(id)s', (/^https?:\/\//i.test(query) ? query : `ytsearch1:${query}`),
-  ], { timeout: 30_000 });
-  const [title, id] = stdout.trim().split('\n');
-  if (!id) throw new Error('no result');
-  return { title, url: `https://www.youtube.com/watch?v=${id}` };
+  // رابط مباشر: ما نحتاج بحث (التحميل يتعامل معه)
+  if (/^https?:\/\//i.test(query)) return { title: query, url: query };
+  try {
+    // --flat-playlist يجيب العنوان والمعرّف بدون فتح الفيديو نفسه
+    const { stdout } = await execFileP(YTDLP_PATH, [
+      ...YT_ARGS, '--flat-playlist', '--print', '%(title)s\n%(id)s', `ytsearch1:${query}`,
+    ], { timeout: 30_000 });
+    const [title, id] = stdout.trim().split('\n');
+    if (!id) throw new Error('no result');
+    return { title, url: `https://www.youtube.com/watch?v=${id}` };
+  } catch (e) {
+    const errs = String(e.stderr || '').split('\n').filter((l) => l.startsWith('ERROR'));
+    throw new Error(errs.join(' | ') || e.message);
+  }
 }
 
 async function ensureYtDlp() {
